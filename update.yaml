@@ -1,0 +1,16 @@
+---
+- name: Update deb based machines. 
+  hosts: all 
+  gather_facts: false 
+  become: yes 
+  become_method: sudo
+  become_user: root
+  tasks:
+
+  - name: Update repositories cache
+    ansible.builtin.apt:
+      update_cache: yes
+
+  - name: Upgrade
+    ansible.builtin.apt:
+      upgrade: yes
