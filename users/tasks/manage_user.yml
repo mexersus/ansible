@@ -1,0 +1,144 @@
+---
+# Manages a single user. Included once per entry in `managed_users`.
+# `user_dir` is the directory name holding that user's env.yaml and *.pub files.
+#
+# The account state is resolved in this order (first match wins):
+#   1. -e user_state=absent      -> run-wide override
+#   2. state: absent in env.yaml -> per-user intent, kept in git
+#   3. default_user_state        -> "present"
+#
+# Deletion is driven by this state, not by the presence of the directory, so a
+# user can be removed while <username>/env.yaml and its keys stay in the repo.
+
+- name: "{{ user_dir }} | Load user definition"
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/{{ user_dir }}/env.yaml"
+    name: user_def
+
+- name: "{{ user_dir }} | Resolve state, home directory and SSH public keys"
+  ansible.builtin.set_fact:
+    resolved_user_state: >-
+      {{ user_state | default(user_def.state | default(default_user_state, true), true) }}
+    resolved_remove_home: >-
+      {{ remove_home | default(user_def.remove_home | default(default_remove_home, true), true)
+         | bool }}
+    user_home: "{{ user_def.home | default(default_home_base ~ '/' ~ user_def.username) }}"
+    user_public_keys: >-
+      {{ query('fileglob', playbook_dir ~ '/' ~ user_dir ~ '/*.pub') | sort | list }}
+
+- name: "{{ user_dir }} | Validate user definition"
+  ansible.builtin.assert:
+    that:
+      - user_def.username is defined
+      - user_def.username | string | length > 0
+      - resolved_user_state in ['present', 'absent']
+    fail_msg: >-
+      {{ user_dir }}/env.yaml must define a non-empty 'username', and state must
+      be either 'present' or 'absent' (got '{{ resolved_user_state }}').
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# Create / update
+# ---------------------------------------------------------------------------
+- name: "{{ user_dir }} | Create and configure account"
+  when: resolved_user_state == 'present'
+  block:
+    - name: "{{ user_dir }} | Ensure primary group exists"
+      ansible.builtin.group:
+        name: "{{ user_def.username }}"
+        state: present
+
+    - name: "{{ user_dir }} | Ensure user account exists"
+      ansible.builtin.user:
+        name: "{{ user_def.username }}"
+        group: "{{ user_def.username }}"
+        groups: "{{ user_def.groups | default(default_groups) }}"
+        append: true
+        shell: "{{ user_def.shell | default(default_shell) }}"
+        home: "{{ user_home }}"
+        create_home: true
+        # env.yaml stores the password in clear text; Linux needs a crypt hash
+        # in /etc/shadow, so it is hashed here at run time. The salt is derived
+        # from the username so repeated runs stay idempotent.
+        password: >-
+          {{ (user_def.passwd
+              | string
+              | password_hash('sha512', 65534 | random(seed=user_def.username) | string))
+             if user_def.passwd is defined else omit }}
+        # Only set the password when the account is created, so manual password
+        # changes on the host are not reverted on every run.
+        update_password: on_create
+        state: present
+
+    - name: "{{ user_dir }} | Warn when no public key is present"
+      ansible.builtin.debug:
+        msg: "No *.pub file found in {{ user_dir }}/ - skipping SSH key setup."
+      when: user_public_keys | length == 0
+
+    - name: "{{ user_dir }} | Authorize SSH public keys"
+      ansible.posix.authorized_key:
+        user: "{{ user_def.username }}"
+        key: "{{ lookup('file', item) }}"
+        state: present
+        # Set explicitly so this also works in --check mode, where the account
+        # may not exist yet and the home directory cannot be looked up.
+        path: "{{ user_home }}/.ssh/authorized_keys"
+        manage_dir: true
+        # Additive: keys added outside this repo are left in place.
+        exclusive: false
+      loop: "{{ user_public_keys }}"
+      loop_control:
+        label: "{{ item | basename }}"
+
+# ---------------------------------------------------------------------------
+# Delete
+# ---------------------------------------------------------------------------
+- name: "{{ user_dir }} | Remove account"
+  when: resolved_user_state == 'absent'
+  block:
+    - name: "{{ user_dir }} | Look up the account"
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ user_def.username }}"
+        fail_key: false
+
+    - name: "{{ user_dir }} | Record whether the account exists"
+      ansible.builtin.set_fact:
+        user_exists: "{{ ansible_facts.getent_passwd[user_def.username] is not none }}"
+
+    - name: "{{ user_dir }} | Report that the account is already gone"
+      ansible.builtin.debug:
+        msg: "User '{{ user_def.username }}' does not exist - nothing to remove."
+      when: not user_exists
+
+    - name: "{{ user_dir }} | Terminate processes owned by the user"
+      # userdel refuses to run while the user still owns live processes.
+      # pkill exits 1 when there was nothing to kill, which is not an error.
+      ansible.builtin.command:
+        cmd: "pkill -KILL -u {{ user_def.username }}"
+      register: pkill_result
+      changed_when: pkill_result.rc == 0
+      failed_when: pkill_result.rc not in [0, 1]
+      when: user_exists
+
+    - name: "{{ user_dir }} | Delete user account"
+      ansible.builtin.user:
+        name: "{{ user_def.username }}"
+        state: absent
+        # Home directory and mail spool are only deleted when explicitly asked.
+        remove: "{{ resolved_remove_home }}"
+        force: "{{ resolved_remove_home }}"
+
+    - name: "{{ user_dir }} | Delete primary group"
+      ansible.builtin.group:
+        name: "{{ user_def.username }}"
+        state: absent
+
+    - name: "{{ user_dir }} | Note that the home directory was kept"
+      ansible.builtin.debug:
+        msg: >-
+          Account removed but {{ user_home }} was left in place. Re-run with
+          -e remove_home=true (or set remove_home: true in env.yaml) to delete it.
+      when:
+        - user_exists
+        - not resolved_remove_home

@@ -1,0 +1,107 @@
+---
+# Provision Linux user accounts from per-user directories.
+#
+# Layout expected next to this playbook:
+#
+#   <username>/env.yaml     -> username, passwd, and optional overrides
+#   <username>/*.pub        -> SSH public key(s) to authorize
+#
+# Accounts are created by default. Set `state: absent` in a user's env.yaml, or
+# pass -e user_state=absent, to delete instead. Deletion is driven by that state
+# rather than by removing the directory, so the definition and keys can stay in
+# git after the account is gone. The home directory is preserved unless
+# remove_home is enabled.
+#
+# Runs as an unprivileged SSH user that has sudo rights. ansible.cfg sets
+# become_ask_pass, so every run prompts once for "BECOME password". Add -k if
+# the SSH login itself needs a password instead of a key.
+#
+# Usage:
+#   ansible-playbook deploy.yml                        # all discovered users
+#   ansible-playbook deploy.yml -e target_users=alice
+#   ansible-playbook deploy.yml -e target_users=alice,bob
+#   ansible-playbook deploy.yml --check --diff         # dry run
+#
+# Deleting:
+#   ansible-playbook deploy.yml -e target_users=alice -e user_state=absent
+#   ansible-playbook deploy.yml -e target_users=alice -e user_state=absent \
+#                               -e remove_home=true   # also wipe the home dir
+#
+# If the sudo user is passwordless, run with --become-password-file /dev/null
+# or set become_ask_pass = False in ansible.cfg.
+- name: Provision users on target hosts
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Defaults applied unless a user's env.yaml overrides them.
+    default_shell: /bin/bash
+    default_home_base: /home
+    default_groups: []
+    default_user_state: present
+    # Deleting a home directory is unrecoverable, so it is opt-in.
+    default_remove_home: false
+
+  pre_tasks:
+    - name: Discover user definition files
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}"
+        patterns: env.yaml
+        file_type: file
+        recurse: true
+        depth: 2
+      register: user_def_files
+      run_once: true
+      delegate_to: localhost
+      become: false
+      check_mode: false
+
+    # Each env.yaml lives in a directory named after the user, so the parent
+    # directory name is the user. Definitions sitting directly in the playbook
+    # directory are ignored.
+    - name: Build the list of users found on disk
+      ansible.builtin.set_fact:
+        discovered_users: >-
+          {{ user_def_files.files
+             | map(attribute='path') | map('dirname')
+             | reject('eq', playbook_dir)
+             | map('basename') | unique | sort | list }}
+      run_once: true
+
+    # `target_users` limits the run to specific users. Extra vars passed as
+    # -e target_users=alice,bob arrive as a plain string, while JSON extra vars
+    # and vars files give a real list, so both forms are accepted here.
+    - name: Select the users to manage
+      ansible.builtin.set_fact:
+        managed_users: >-
+          {{ discovered_users
+             if (target_users is not defined or not target_users)
+             else ((target_users | regex_replace('[^A-Za-z0-9_,.-]', '') | split(','))
+                   if target_users is string else target_users)
+                  | map('trim') | select() | list }}
+      run_once: true
+
+    - name: Ensure at least one user definition exists
+      ansible.builtin.assert:
+        that: managed_users | length > 0
+        fail_msg: >-
+          No user definitions found. Create a <username>/env.yaml directory
+          next to deploy.yml first.
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Report users that will be managed
+      ansible.builtin.debug:
+        msg: "Managing users: {{ managed_users | join(', ') }}"
+      run_once: true
+
+  tasks:
+    - name: Provision each user
+      ansible.builtin.include_tasks: tasks/manage_user.yml
+      loop: "{{ managed_users }}"
+      loop_control:
+        loop_var: user_dir
+        label: "{{ user_dir }}"
