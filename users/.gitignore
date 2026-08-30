@@ -1,0 +1,10 @@
+*
+
+!exampleuser/*
+!tasks/*
+!ansible.cfg
+!deploy.yml
+!inventory
+!requirements.yml
+!.gitignore
+
